@@ -1,0 +1,23 @@
+{
+  "name": "mentorbooking",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mlyzan/MentorBooking.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/mlyzan/MentorBooking/issues"
+  },
+  "homepage": "https://github.com/mlyzan/MentorBooking#readme",
+  "dependencies": {
+    "aws-cdk-lib": "^2.261.0",
+    "dotenv": "^17.4.2"
+  }
+}
