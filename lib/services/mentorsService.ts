@@ -65,14 +65,14 @@ export const getTimeSlots: Handler = async (event: GetTimeSlotsEvent): Promise<{
 
   const params: ScanCommandInput = {
     TableName: TimeSlotsTableName,
-    FilterExpression: '#id = :id AND #isAvailable = :true AND #startTime > :now',
+    FilterExpression: '#mentorId = :mentorId AND #isAvailable = :true AND #startTime > :now',
     ExpressionAttributeNames: {
-      '#id': 'id',
+      '#mentorId': 'mentorId',
       '#isAvailable': 'isAvailable',
       '#startTime': 'startTime',
     },
     ExpressionAttributeValues: {
-      ':id': mentorId,
+      ':mentorId': mentorId,
       ':true': true,
       ':now': startTime || new Date().toISOString(),
     },
