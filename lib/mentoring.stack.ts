@@ -5,7 +5,7 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import { MentorsTableName } from './constants';
+import { MentorsTableName, TimeSlotsTableName } from './constants';
 
 
 export class MentoringLambdaStack extends cdk.Stack {
@@ -30,6 +30,14 @@ export class MentoringLambdaStack extends cdk.Stack {
       },
     });
 
+    const timeSlotsTable = new dynamodb.Table(this, "TimeSlots", {
+      tableName: TimeSlotsTableName,
+      partitionKey: {
+        name: "id",
+        type: dynamodb.AttributeType.STRING,
+      },
+    });
+
     // Lambda functions
     const getMentorsLambda = new NodejsFunction(this, 'getMentors', {
       ...commonProps,
@@ -38,7 +46,17 @@ export class MentoringLambdaStack extends cdk.Stack {
         MENTORS_TABLE_NAME: MentorsTableName
       },
     });
+
+    const getTimeSlotsLambda = new NodejsFunction(this, 'getTimeSlots', {
+      ...commonProps,
+      handler: 'getTimeSlots',
+      environment: {
+        TIME_SLOTS_TABLE_NAME: TimeSlotsTableName
+      },
+    });
+
     mentorsTable.grantReadData(getMentorsLambda);
+    timeSlotsTable.grantReadData(getTimeSlotsLambda);
 
     // API Gateways
     const api = new apigateway.RestApi(this, "api", {
@@ -61,11 +79,41 @@ export class MentoringLambdaStack extends cdk.Stack {
       },
     });
 
+    const timeSlotsLambdaIntegration = new apigateway.LambdaIntegration(getTimeSlotsLambda, {
+      integrationResponses: [{
+        statusCode: '200',
+        responseParameters: {
+          "method.response.header.Access-Control-Allow-Origin": "'*'",
+        },
+      }],
+      proxy: false,
+      requestTemplates: {
+        'application/json': `{
+          "mentorId": "$util.escapeJavaScript($input.params('mentorId'))",
+          "startTime": "$util.escapeJavaScript($input.params('startTime'))"
+        }`,
+      },
+    });
+
     const mentorsResource = api.root.addResource("mentors");
+    const timeSlotsResource = mentorsResource.addResource("{mentorId}").addResource("timeslots");
 
     mentorsResource.addMethod('GET', mentorsLambdaIntegration, {
       requestParameters: {
         'method.request.querystring.expertises': false
+      },
+      methodResponses: [{
+        statusCode: '200',
+        responseParameters: {
+          'method.response.header.Access-Control-Allow-Origin': true,
+        },
+      }],
+    });
+
+    timeSlotsResource.addMethod('GET', timeSlotsLambdaIntegration, {
+      requestParameters: {
+        'method.request.path.mentorId': true,
+        'method.request.querystring.startTime': false
       },
       methodResponses: [{
         statusCode: '200',
