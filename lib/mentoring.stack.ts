@@ -5,7 +5,7 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import { MentorsTableName, TimeSlotsTableName } from './constants';
+import { BookingsTableName, MentorsTableName, TimeSlotsTableName } from './constants';
 
 
 export class MentoringLambdaStack extends cdk.Stack {
@@ -38,6 +38,14 @@ export class MentoringLambdaStack extends cdk.Stack {
       },
     });
 
+    const bookingsTable = new dynamodb.Table(this, "Bookings", {
+      tableName: BookingsTableName,
+      partitionKey: {
+        name: "id",
+        type: dynamodb.AttributeType.STRING,
+      },
+    });
+
     // Lambda functions
     const getMentorsLambda = new NodejsFunction(this, 'getMentors', {
       ...commonProps,
@@ -46,6 +54,7 @@ export class MentoringLambdaStack extends cdk.Stack {
         MENTORS_TABLE_NAME: MentorsTableName
       },
     });
+    mentorsTable.grantReadData(getMentorsLambda);
 
     const getTimeSlotsLambda = new NodejsFunction(this, 'getTimeSlots', {
       ...commonProps,
@@ -54,9 +63,18 @@ export class MentoringLambdaStack extends cdk.Stack {
         TIME_SLOTS_TABLE_NAME: TimeSlotsTableName
       },
     });
-
-    mentorsTable.grantReadData(getMentorsLambda);
     timeSlotsTable.grantReadData(getTimeSlotsLambda);
+
+    const bookTimeSlotLambda = new NodejsFunction(this, 'bookTimeSlot', {
+      ...commonProps,
+      handler: 'bookTimeSlot',
+      environment: {
+        BOOKINGS_TABLE_NAME: BookingsTableName,
+        TIME_SLOTS_TABLE_NAME: TimeSlotsTableName
+      },
+    });
+    bookingsTable.grantWriteData(bookTimeSlotLambda);
+    timeSlotsTable.grantReadWriteData(bookTimeSlotLambda); 
 
     // API Gateways
     const api = new apigateway.RestApi(this, "api", {
@@ -65,12 +83,24 @@ export class MentoringLambdaStack extends cdk.Stack {
     });
     
     const mentorsLambdaIntegration = new apigateway.LambdaIntegration(getMentorsLambda, {
-      integrationResponses: [{
-        statusCode: '200',
-        responseParameters: {
-          "method.response.header.Access-Control-Allow-Origin": "'*'",
+      integrationResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
         },
-      }],
+        {
+          statusCode: '500',
+          selectionPattern: '^InternalServerError:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("InternalServerError: ", ""))"}`,
+          },
+        }, 
+      ],
       proxy: false,
       requestTemplates: {
         'application/json': `{
@@ -80,18 +110,66 @@ export class MentoringLambdaStack extends cdk.Stack {
     });
 
     const timeSlotsLambdaIntegration = new apigateway.LambdaIntegration(getTimeSlotsLambda, {
-      integrationResponses: [{
-        statusCode: '200',
-        responseParameters: {
-          "method.response.header.Access-Control-Allow-Origin": "'*'",
+      integrationResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
         },
-      }],
+        {
+          statusCode: '500',
+          selectionPattern: '^InternalServerError:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("InternalServerError: ", ""))"}`,
+          },
+        },
+      ],
       proxy: false,
       requestTemplates: {
         'application/json': `{
           "mentorId": "$util.escapeJavaScript($input.params('mentorId'))",
           "startTime": "$util.escapeJavaScript($input.params('startTime'))"
         }`,
+      },
+    });
+
+    const bookTimeSlotLambdaIntegration = new apigateway.LambdaIntegration(bookTimeSlotLambda, {
+      integrationResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+        },
+        {
+          statusCode: '404',
+          selectionPattern: '^NotFound:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("NotFound: ", ""))"}`,
+          },
+        },
+        {
+          statusCode: '500',
+          selectionPattern: '^InternalServerError:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("InternalServerError: ", ""))"}`,
+          },
+        },
+      ],
+      proxy: false,
+      requestTemplates: {
+        "application/json":
+        `{ "body": $input.json('$') }`
       },
     });
 
@@ -102,12 +180,20 @@ export class MentoringLambdaStack extends cdk.Stack {
       requestParameters: {
         'method.request.querystring.expertises': false
       },
-      methodResponses: [{
-        statusCode: '200',
-        responseParameters: {
-          'method.response.header.Access-Control-Allow-Origin': true,
+      methodResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
         },
-      }],
+        {
+          statusCode: '500',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+      ],
     });
 
     timeSlotsResource.addMethod('GET', timeSlotsLambdaIntegration, {
@@ -115,12 +201,44 @@ export class MentoringLambdaStack extends cdk.Stack {
         'method.request.path.mentorId': true,
         'method.request.querystring.startTime': false
       },
-      methodResponses: [{
-        statusCode: '200',
-        responseParameters: {
-          'method.response.header.Access-Control-Allow-Origin': true,
+      methodResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
         },
-      }],
+        {
+          statusCode: '500',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+      ],
+    });
+
+    const bookingsResource = api.root.addResource("bookings");
+    bookingsResource.addMethod('POST', bookTimeSlotLambdaIntegration, {
+      methodResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+        {
+          statusCode: '404',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+        {
+          statusCode: '500',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+      ],
     });
   }
 }

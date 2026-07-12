@@ -20,8 +20,10 @@
   },
   "homepage": "https://github.com/mlyzan/MentorBooking#readme",
   "dependencies": {
+    "@types/uuid": "^10.0.0",
     "aws-cdk-lib": "^2.261.0",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "uuid": "^14.0.1"
   },
   "devDependencies": {
     "@aws-sdk/client-dynamodb": "^3.1080.0",
