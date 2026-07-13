@@ -1,3 +1,10 @@
 export const MentorsTableName = 'MentorsTable';
+export const StudentsTableName = 'StudentsTable';
 export const TimeSlotsTableName = 'TimeSlotsTable';
 export const BookingsTableName = 'BookingsTable';
+export const BookingNotificationsQueueUrlEnv = 'BOOKING_NOTIFICATIONS_QUEUE_URL';
+export const BookingNotificationsTopicArnEnv = 'BOOKING_NOTIFICATIONS_TOPIC_ARN';
+export const MentorsTableNameEnv = 'MENTORS_TABLE_NAME';
+export const StudentsTableNameEnv = 'STUDENTS_TABLE_NAME';
+export const TimeSlotsTableNameEnv = 'TIME_SLOTS_TABLE_NAME';
+export const BookingsTableNameEnv = 'BOOKINGS_TABLE_NAME';

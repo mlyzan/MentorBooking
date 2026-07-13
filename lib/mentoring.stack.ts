@@ -2,10 +2,25 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import { BookingsTableName, MentorsTableName, TimeSlotsTableName } from './constants';
+import {
+  BookingNotificationsQueueUrlEnv,
+  BookingNotificationsTopicArnEnv,
+  BookingsTableName,
+  BookingsTableNameEnv,
+  MentorsTableName,
+  MentorsTableNameEnv,
+  StudentsTableName,
+  StudentsTableNameEnv,
+  TimeSlotsTableName,
+  TimeSlotsTableNameEnv,
+} from './constants';
 
 
 export class MentoringLambdaStack extends cdk.Stack {
@@ -46,12 +61,37 @@ export class MentoringLambdaStack extends cdk.Stack {
       },
     });
 
+    const studentsTable = new dynamodb.Table(this, "Students", {
+      tableName: StudentsTableName,
+      partitionKey: {
+        name: "id",
+        type: dynamodb.AttributeType.STRING,
+      },
+    });
+
+    // Notifications infrastructure
+    const bookingNotificationsDlq = new sqs.Queue(this, "BookingNotificationsDLQ", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
+    const bookingNotificationsQueue = new sqs.Queue(this, "BookingNotificationsQueue", {
+      visibilityTimeout: cdk.Duration.seconds(30),
+      deadLetterQueue: {
+        queue: bookingNotificationsDlq,
+        maxReceiveCount: 3,
+      },
+    });
+
+    const bookingNotificationsTopic = new sns.Topic(this, "BookingNotificationsTopic", {
+      displayName: "Booking Notifications",
+    });
+
     // Lambda functions
     const getMentorsLambda = new NodejsFunction(this, 'getMentors', {
       ...commonProps,
       handler: 'getMentors',
       environment: {
-        MENTORS_TABLE_NAME: MentorsTableName
+        [MentorsTableNameEnv]: MentorsTableName,
       },
     });
     mentorsTable.grantReadData(getMentorsLambda);
@@ -60,7 +100,7 @@ export class MentoringLambdaStack extends cdk.Stack {
       ...commonProps,
       handler: 'getTimeSlots',
       environment: {
-        TIME_SLOTS_TABLE_NAME: TimeSlotsTableName
+        [TimeSlotsTableNameEnv]: TimeSlotsTableName,
       },
     });
     timeSlotsTable.grantReadData(getTimeSlotsLambda);
@@ -69,12 +109,34 @@ export class MentoringLambdaStack extends cdk.Stack {
       ...commonProps,
       handler: 'bookTimeSlot',
       environment: {
-        BOOKINGS_TABLE_NAME: BookingsTableName,
-        TIME_SLOTS_TABLE_NAME: TimeSlotsTableName
+        [BookingsTableNameEnv]: BookingsTableName,
+        [TimeSlotsTableNameEnv]: TimeSlotsTableName,
+        [BookingNotificationsQueueUrlEnv]: bookingNotificationsQueue.queueUrl,
       },
     });
     bookingsTable.grantWriteData(bookTimeSlotLambda);
-    timeSlotsTable.grantReadWriteData(bookTimeSlotLambda); 
+    timeSlotsTable.grantReadWriteData(bookTimeSlotLambda);
+    bookingNotificationsQueue.grantSendMessages(bookTimeSlotLambda);
+
+    const sendBookingNotificationLambda = new NodejsFunction(this, 'sendBookingNotification', {
+      ...commonProps,
+      handler: 'sendBookingNotification',
+      environment: {
+        [MentorsTableNameEnv]: MentorsTableName,
+        [StudentsTableNameEnv]: StudentsTableName,
+        [BookingNotificationsTopicArnEnv]: bookingNotificationsTopic.topicArn,
+      },
+    });
+    mentorsTable.grantReadData(sendBookingNotificationLambda);
+    studentsTable.grantReadData(sendBookingNotificationLambda);
+    bookingNotificationsTopic.grantPublish(sendBookingNotificationLambda);
+    sendBookingNotificationLambda.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['sns:Subscribe'],
+      resources: [bookingNotificationsTopic.topicArn],
+    }));
+    sendBookingNotificationLambda.addEventSource(new SqsEventSource(bookingNotificationsQueue, {
+      batchSize: 10,
+    }));
 
     // API Gateways
     const api = new apigateway.RestApi(this, "api", {

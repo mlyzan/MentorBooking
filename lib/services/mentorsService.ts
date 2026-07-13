@@ -1,16 +1,34 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DeleteCommand, DynamoDBDocumentClient, PutCommand, ScanCommand, ScanCommandInput } from '@aws-sdk/lib-dynamodb';
-import { BookingsTableName, MentorsTableName, TimeSlotsTableName } from '../constants';
-import { Handler } from 'aws-lambda';
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand, ScanCommandInput } from '@aws-sdk/lib-dynamodb';
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { SNSClient, PublishCommand, SubscribeCommand } from '@aws-sdk/client-sns';
+import {
+  BookingNotificationsQueueUrlEnv,
+  BookingNotificationsTopicArnEnv,
+  BookingsTableName,
+  MentorsTableName,
+  StudentsTableName,
+  TimeSlotsTableName,
+} from '../constants';
+import { Handler, SQSEvent, SQSRecord } from 'aws-lambda';
 import { v4 as uuidv4 } from 'uuid';
 
 const client = new DynamoDBClient({});
 const doc = DynamoDBDocumentClient.from(client);
+const sqs = new SQSClient({});
+const sns = new SNSClient({});
 
 export interface Mentor {
   id: string;
   name: string;
+  email: string;
   expertises: string[];
+}
+
+export interface Student {
+  id: string;
+  name: string;
+  email: string;
 }
 
 export interface GetMentorsEvent {
@@ -22,11 +40,23 @@ export interface TimeSlot {
   mentorId: string;
   startTime: string;
   endTime: string;
+  available: boolean;
 }
 
 export interface GetTimeSlotsEvent {
   mentorId: string;
   startTime?: string;
+}
+
+export interface BookingCreatedEvent {
+  eventType: 'booking.created';
+  bookingId: string;
+  timeSlotId: string;
+  mentorId: string;
+  studentId: string;
+  startTime: string;
+  endTime: string;
+  createdAt: string;
 }
 
 const parseCsv = (value?: string): string[] => value ? value.split(',').map(v => v.trim()).filter(Boolean) : [];
@@ -71,14 +101,16 @@ export const getTimeSlots: Handler = async (event: GetTimeSlotsEvent): Promise<{
 
     const params: ScanCommandInput = {
       TableName: TimeSlotsTableName,
-      FilterExpression: '#mentorId = :mentorId AND #startTime > :now',
+      FilterExpression: '#mentorId = :mentorId AND #startTime > :now AND #available = :available',
       ExpressionAttributeNames: {
         '#mentorId': 'mentorId',
         '#startTime': 'startTime',
+        '#available': 'available',
       },
       ExpressionAttributeValues: {
         ':mentorId': mentorId,
         ':now': startTime || new Date().toISOString(),
+        ':available': true,
       },
     };
     console.log(`ScanCommand params: ${JSON.stringify(params)}`);
@@ -94,28 +126,30 @@ export const getTimeSlots: Handler = async (event: GetTimeSlotsEvent): Promise<{
 };
 
 export interface BookTimeSlotEvent {
-  body: { timeSlotId: string; mentorId: string; startTime: string; endTime: string };
+  body: { timeSlotId: string; mentorId: string; studentId: string; startTime: string; endTime: string };
 }
 
-export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent, context: any, callback: any): Promise<{ message: string }> => {
+export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent): Promise<{ message: string; bookingId: string }> => {
   try {
-    const { timeSlotId, mentorId, startTime, endTime } = event.body;
+    const { timeSlotId, mentorId, studentId, startTime, endTime } = event.body;
 
     // Check if the time slot is available
     const params: ScanCommandInput = {
       TableName: TimeSlotsTableName,
-      FilterExpression: '#id = :timeSlotId AND #mentorId = :mentorId AND #startTime >= :startTime AND #endTime <= :endTime',
+      FilterExpression: '#id = :timeSlotId AND #mentorId = :mentorId AND #startTime >= :startTime AND #endTime <= :endTime AND #available = :available',
       ExpressionAttributeNames: {
         '#id': 'id',
         '#mentorId': 'mentorId',
         '#startTime': 'startTime',
         '#endTime': 'endTime',
+        '#available': 'available',
       },
       ExpressionAttributeValues: {
         ':timeSlotId': timeSlotId,
         ':mentorId': mentorId,
         ':startTime': startTime,
         ':endTime': endTime,
+        ':available': true,
       },
     };
     console.log(`ScanCommand params for booking: ${JSON.stringify(params)}`);
@@ -127,31 +161,160 @@ export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent, context: a
       throw new Error('NotFound: Time slot is not available for booking.');
     }
 
-    // Delete the time slot from the TimeSlots table to mark it as booked
+    // Mark time slot available false
     const timeSlot = timeSlots[0];
-    await doc.send(new DeleteCommand({
+    await doc.send(new PutCommand({
       TableName: TimeSlotsTableName,
-      Key: { id: timeSlot.id },
+      Item: {
+        ...timeSlot,
+        available: false,
+      },
     }));
+
+    const bookingId = uuidv4();
+    const createdAt = new Date().toISOString();
 
     // Create a booking record in the Bookings table
     await doc.send(new PutCommand({
       TableName: BookingsTableName,
       Item: {
-        id: uuidv4(),
+        id: bookingId,
         mentorId,
+        studentId,
         startTime,
         endTime,
+        createdAt,
       },
     }));
 
-    return { message: 'Time slot booked successfully.' };
+    // Enqueue booking.created event for post-processing (email notifications)
+    const queueUrl = process.env[BookingNotificationsQueueUrlEnv];
+    if (!queueUrl) {
+      throw new Error(`InternalServerError: ${BookingNotificationsQueueUrlEnv} is not configured.`);
+    }
+    const bookingEvent: BookingCreatedEvent = {
+      eventType: 'booking.created',
+      bookingId,
+      timeSlotId,
+      mentorId,
+      studentId,
+      startTime,
+      endTime,
+      createdAt,
+    };
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: queueUrl,
+      MessageBody: JSON.stringify(bookingEvent),
+    }));
+
+    return { message: 'Time slot booked successfully.', bookingId };
   } catch(error: any) {
     console.error('Error booking time slot:', error);
     if (error.message.startsWith('NotFound:')) {
       throw new Error(error.message);
+    } else if (error.message.startsWith('InternalServerError:')) {
+      throw new Error(error.message);
     } else {
       throw new Error('InternalServerError: An error occurred while booking the time slot.');
+    }
+  }
+};
+
+const getMentorById = async (id: string): Promise<Mentor> => {
+  const mentorsTable = MentorsTableName;
+  const result = await doc.send(new GetCommand({ TableName: mentorsTable, Key: { id } }));
+  if (!result.Item) {
+    throw new Error(`Mentor ${id} not found`);
+  }
+  return result.Item as Mentor;
+};
+
+const getStudentById = async (id: string): Promise<Student> => {
+  const studentsTable = StudentsTableName;
+  const result = await doc.send(new GetCommand({ TableName: studentsTable, Key: { id } }));
+  if (!result.Item) {
+    throw new Error(`Student ${id} not found`);
+  }
+  return result.Item as Student;
+};
+
+const ensureEmailSubscription = async (topicArn: string, email: string): Promise<void> => {
+  await sns.send(new SubscribeCommand({
+    TopicArn: topicArn,
+    Protocol: 'email',
+    Endpoint: email,
+    ReturnSubscriptionArn: true,
+    Attributes: {
+      FilterPolicy: JSON.stringify({ email: [email] }),
+      FilterPolicyScope: 'MessageAttributes',
+    },
+  }));
+};
+
+const publishBookingEmail = async (
+  topicArn: string,
+  recipient: 'student' | 'mentor',
+  email: string,
+  subject: string,
+  message: string,
+): Promise<void> => {
+  await sns.send(new PublishCommand({
+    TopicArn: topicArn,
+    Subject: subject,
+    Message: message,
+    MessageAttributes: {
+      recipient: { DataType: 'String', StringValue: recipient },
+      email: { DataType: 'String', StringValue: email },
+    },
+  }));
+};
+
+const processBookingRecord = async (record: SQSRecord, topicArn: string): Promise<void> => {
+  const event = JSON.parse(record.body) as BookingCreatedEvent;
+  if (event.eventType !== 'booking.created') {
+    console.warn(`Skipping unknown event type: ${event.eventType}`);
+    return;
+  }
+
+  const [mentor, student] = await Promise.all([
+    getMentorById(event.mentorId),
+    getStudentById(event.studentId),
+  ]);
+
+  const subject = 'Booking confirmed';
+  const studentMessage =
+    `Hi ${student.name},\n\n` +
+    `Your booking with ${mentor.name} is confirmed for ${event.startTime} – ${event.endTime}.\n` +
+    `Booking ID: ${event.bookingId}\n`;
+  const mentorMessage =
+    `Hi ${mentor.name},\n\n` +
+    `${student.name} has booked a session with you for ${event.startTime} – ${event.endTime}.\n` +
+    `Booking ID: ${event.bookingId}\n`;
+
+  await Promise.all([
+    ensureEmailSubscription(topicArn, student.email),
+    ensureEmailSubscription(topicArn, mentor.email),
+  ]);
+
+  await Promise.all([
+    publishBookingEmail(topicArn, 'student', student.email, subject, studentMessage),
+    publishBookingEmail(topicArn, 'mentor', mentor.email, subject, mentorMessage),
+  ]);
+};
+
+export const sendBookingNotification: Handler = async (event: SQSEvent): Promise<void> => {
+  const topicArn = process.env[BookingNotificationsTopicArnEnv];
+  console.log(`Booking notification topic ARN: ${topicArn}`);
+  if (!topicArn) {
+    throw new Error(`${BookingNotificationsTopicArnEnv} is not configured.`);
+  }
+
+  for (const record of event.Records) {
+    try {
+      await processBookingRecord(record, topicArn);
+    } catch (error) {
+      console.error(`Failed to process record ${record.messageId}:`, error);
+      throw error;
     }
   }
 };
