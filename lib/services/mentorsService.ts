@@ -1,7 +1,7 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand, ScanCommandInput } from '@aws-sdk/lib-dynamodb';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
-import { SNSClient, PublishCommand, SubscribeCommand } from '@aws-sdk/client-sns';
+import { SNSClient, PublishCommand, SubscribeCommand, ListSubscriptionsByTopicCommand } from '@aws-sdk/client-sns';
 import {
   BookingNotificationsQueueUrlEnv,
   BookingNotificationsTopicArnEnv,
@@ -308,7 +308,27 @@ const getStudentById = async (id: string): Promise<Student> => {
   return result.Item as Student;
 };
 
+const isEmailSubscribed = async (topicArn: string, email: string): Promise<boolean> => {
+  let nextToken: string | undefined;
+  do {
+    const res = await sns.send(new ListSubscriptionsByTopicCommand({
+      TopicArn: topicArn,
+      NextToken: nextToken,
+    }));
+    const found = res.Subscriptions?.some(
+      s => s.Protocol === 'email'
+        && s.Endpoint === email
+        && s.SubscriptionArn
+        && s.SubscriptionArn !== 'PendingConfirmation',
+    );
+    if (found) return true;
+    nextToken = res.NextToken;
+  } while (nextToken);
+  return false;
+};
+
 const ensureEmailSubscription = async (topicArn: string, email: string): Promise<void> => {
+  if (await isEmailSubscribed(topicArn, email)) return;
   await sns.send(new SubscribeCommand({
     TopicArn: topicArn,
     Protocol: 'email',

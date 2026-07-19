@@ -144,7 +144,7 @@ export class MentoringLambdaStack extends cdk.Stack {
     studentsTable.grantReadData(sendBookingNotificationLambda);
     bookingNotificationsTopic.grantPublish(sendBookingNotificationLambda);
     sendBookingNotificationLambda.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['sns:Subscribe'],
+      actions: ['sns:Subscribe', 'sns:ListSubscriptionsByTopic'],
       resources: [bookingNotificationsTopic.topicArn],
     }));
     sendBookingNotificationLambda.addEventSource(new SqsEventSource(bookingNotificationsQueue, {
