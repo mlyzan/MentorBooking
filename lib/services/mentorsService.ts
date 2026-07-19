@@ -129,6 +129,10 @@ export interface BookTimeSlotEvent {
   body: { timeSlotId: string; mentorId: string; studentId: string; startTime: string; endTime: string };
 }
 
+export interface CancelBookingEvent {
+  bookingId: string;
+}
+
 export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent): Promise<{ message: string; bookingId: string }> => {
   try {
     const { timeSlotId, mentorId, studentId, startTime, endTime } = event.body;
@@ -179,6 +183,7 @@ export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent): Promise<{
       TableName: BookingsTableName,
       Item: {
         id: bookingId,
+        timeSlotId,
         mentorId,
         studentId,
         startTime,
@@ -220,9 +225,49 @@ export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent): Promise<{
   }
 };
 
+export const cancelBooking: Handler = async (event: CancelBookingEvent): Promise<{message: string}> => {
+  try {
+    const { bookingId } = event;
+    console.log(`Canceling booking with ID: ${bookingId}`);
+    const result = await doc.send(new GetCommand({
+      TableName: BookingsTableName,
+      Key: { id: bookingId },
+    }));
+    if (!result.Item) {
+      throw new Error(`NotFound: Not found booking by ID ${bookingId}`);
+    }
+    const timeSlot = await doc.send(new GetCommand({
+      TableName: TimeSlotsTableName,
+      Key: { id: result.Item.timeSlotId },
+    }));
+    if (!timeSlot.Item) {
+      throw new Error(`NotFound: Not found time slot by ID ${result.Item.timeSlotId}`);
+    }
+    await doc.send(new PutCommand({
+      TableName: TimeSlotsTableName,
+      Item: {
+        ...timeSlot.Item,
+        available: true,
+      },
+    }));
+    await doc.send(new DeleteCommand({
+      TableName: BookingsTableName,
+      Key: { id: bookingId },
+    }));
+
+    return {message: 'Booking canceled!'}
+  } catch(error: any) {
+    console.error('Error booking time slot:', error);
+    if (error.message.startsWith('NotFound:')) {
+      throw new Error(error.message);
+    } else {
+      throw new Error('InternalServerError: An error occurred while canceling the time slot.');
+    }
+  }
+}
+
 const getMentorById = async (id: string): Promise<Mentor> => {
-  const mentorsTable = MentorsTableName;
-  const result = await doc.send(new GetCommand({ TableName: mentorsTable, Key: { id } }));
+  const result = await doc.send(new GetCommand({ TableName: MentorsTableName, Key: { id } }));
   if (!result.Item) {
     throw new Error(`Mentor ${id} not found`);
   }
@@ -230,8 +275,7 @@ const getMentorById = async (id: string): Promise<Mentor> => {
 };
 
 const getStudentById = async (id: string): Promise<Student> => {
-  const studentsTable = StudentsTableName;
-  const result = await doc.send(new GetCommand({ TableName: studentsTable, Key: { id } }));
+  const result = await doc.send(new GetCommand({ TableName: StudentsTableName, Key: { id } }));
   if (!result.Item) {
     throw new Error(`Student ${id} not found`);
   }

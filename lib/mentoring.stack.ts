@@ -118,6 +118,19 @@ export class MentoringLambdaStack extends cdk.Stack {
     timeSlotsTable.grantReadWriteData(bookTimeSlotLambda);
     bookingNotificationsQueue.grantSendMessages(bookTimeSlotLambda);
 
+    const cancelBookingLambda = new NodejsFunction(this, 'cancelBooking', {
+      ...commonProps,
+      handler: 'cancelBooking',
+      environment: {
+        [BookingsTableNameEnv]: BookingsTableName,
+        [TimeSlotsTableNameEnv]: TimeSlotsTableName,
+        [BookingNotificationsQueueUrlEnv]: bookingNotificationsQueue.queueUrl,
+      },
+    });
+    bookingsTable.grantReadWriteData(cancelBookingLambda);
+    timeSlotsTable.grantReadWriteData(cancelBookingLambda);
+    bookingNotificationsQueue.grantSendMessages(cancelBookingLambda);
+
     const sendBookingNotificationLambda = new NodejsFunction(this, 'sendBookingNotification', {
       ...commonProps,
       handler: 'sendBookingNotification',
@@ -235,6 +248,43 @@ export class MentoringLambdaStack extends cdk.Stack {
       },
     });
 
+    const cancelBookingLambdaIntegration = new apigateway.LambdaIntegration(cancelBookingLambda, {
+      integrationResponses: [
+        {
+          statusCode: '204',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+        },
+        {
+          statusCode: '404',
+          selectionPattern: '^NotFound:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("NotFound: ", ""))"}`,
+          },
+        },
+        {
+          statusCode: '500',
+          selectionPattern: '^InternalServerError:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("InternalServerError: ", ""))"}`,
+          },
+        },
+      ],
+      proxy: false,
+      requestTemplates: {
+        'application/json': `{
+          "bookingId": "$util.escapeJavaScript($input.params('bookingId'))"
+        }`,
+      },
+    });
+
     const mentorsResource = api.root.addResource("mentors");
     const timeSlotsResource = mentorsResource.addResource("{mentorId}").addResource("timeslots");
 
@@ -302,5 +352,32 @@ export class MentoringLambdaStack extends cdk.Stack {
         },
       ],
     });
+
+    const deleteBookingResource = bookingsResource.addResource("{bookingId}")
+    deleteBookingResource.addMethod('DELETE', cancelBookingLambdaIntegration, {
+      requestParameters: {
+        'method.request.path.bookingId': true
+      },
+      methodResponses: [
+        {
+          statusCode: '204',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+        {
+          statusCode: '404',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+        {
+          statusCode: '500',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+      ],
+    })
   }
 }
