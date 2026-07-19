@@ -82,7 +82,7 @@ export class MentoringLambdaStack extends cdk.Stack {
       },
     });
 
-    const bookingNotificationsTopic = new sns.Topic(this, "BookingNotificationsTopic", {
+    const bookingNotificationsTopic = new sns.Topic(this, "BookingNotificationsTopicV2", {
       displayName: "Booking Notifications",
     });
 

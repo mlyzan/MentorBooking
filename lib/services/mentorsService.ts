@@ -59,6 +59,16 @@ export interface BookingCreatedEvent {
   createdAt: string;
 }
 
+export interface BookingCanceledEvent {
+  eventType: 'booking.canceled';
+  bookingId: string;
+  timeSlotId: string;
+  mentorId: string;
+  studentId: string;
+  startTime: string;
+  endTime: string;
+}
+
 const parseCsv = (value?: string): string[] => value ? value.split(',').map(v => v.trim()).filter(Boolean) : [];
 
 export const getMentors: Handler = async (event: GetMentorsEvent = {}): Promise<{ mentors: Mentor[] }> => {
@@ -82,7 +92,6 @@ export const getMentors: Handler = async (event: GetMentorsEvent = {}): Promise<
       params.ExpressionAttributeNames = ExpressionAttributeNames;
       params.ExpressionAttributeValues = ExpressionAttributeValues;
     }
-    console.log(`ScanCommand params: ${JSON.stringify(params)}`);
 
     const result = await doc.send(new ScanCommand(params));
     let mentors = (result.Items as Mentor[]) || [];
@@ -113,7 +122,6 @@ export const getTimeSlots: Handler = async (event: GetTimeSlotsEvent): Promise<{
         ':available': true,
       },
     };
-    console.log(`ScanCommand params: ${JSON.stringify(params)}`);
 
     const result = await doc.send(new ScanCommand(params));
     const timeSlots = (result.Items as TimeSlot[]) || [];
@@ -156,7 +164,6 @@ export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent): Promise<{
         ':available': true,
       },
     };
-    console.log(`ScanCommand params for booking: ${JSON.stringify(params)}`);
 
     const result = await doc.send(new ScanCommand(params));
     const timeSlots = (result.Items as TimeSlot[]) || [];
@@ -228,7 +235,6 @@ export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent): Promise<{
 export const cancelBooking: Handler = async (event: CancelBookingEvent): Promise<{message: string}> => {
   try {
     const { bookingId } = event;
-    console.log(`Canceling booking with ID: ${bookingId}`);
     const result = await doc.send(new GetCommand({
       TableName: BookingsTableName,
       Key: { id: bookingId },
@@ -253,6 +259,26 @@ export const cancelBooking: Handler = async (event: CancelBookingEvent): Promise
     await doc.send(new DeleteCommand({
       TableName: BookingsTableName,
       Key: { id: bookingId },
+    }));
+
+
+    // Enqueue booking.canceled event for post-processing (email notifications)
+    const queueUrl = process.env[BookingNotificationsQueueUrlEnv];
+    if (!queueUrl) {
+      throw new Error(`InternalServerError: ${BookingNotificationsQueueUrlEnv} is not configured.`);
+    }
+    const bookingEvent: BookingCanceledEvent = {
+      eventType: 'booking.canceled',
+      bookingId,
+      timeSlotId: timeSlot.Item.id,
+      mentorId: timeSlot.Item.mentorId,
+      studentId: result.Item.studentId,
+      startTime: result.Item.startTime,
+      endTime: result.Item.endTime,
+    };
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: queueUrl,
+      MessageBody: JSON.stringify(bookingEvent),
     }));
 
     return {message: 'Booking canceled!'}
@@ -313,10 +339,35 @@ const publishBookingEmail = async (
   }));
 };
 
+const constructBookingEmailMessage = (recipient: 'student' | 'mentor', mentor: Mentor, student: Student, event: BookingCreatedEvent): string => {
+  if (recipient === 'student') {
+    return `Hi ${student.name},\n\n` +
+      `Your booking with ${mentor.name} is confirmed for ${event.startTime} – ${event.endTime}.\n` +
+      `Booking ID: ${event.bookingId}\n`;
+  } else {
+    return `Hi ${mentor.name},\n\n` +
+      `${student.name} has booked a session with you for ${event.startTime} – ${event.endTime}.\n` +
+      `Booking ID: ${event.bookingId}\n`;
+  }
+};
+
+const constructCancellationEmailMessage = (recipient: 'student' | 'mentor', mentor: Mentor, student: Student, event: BookingCanceledEvent): string => {
+  if (recipient === 'student') {
+    return `Hi ${student.name},\n\n` +
+      `Your booking with ${mentor.name} for ${event.startTime} – ${event.endTime} has been canceled.\n` +
+      `Booking ID: ${event.bookingId}\n`;
+  } else {
+    return `Hi ${mentor.name},\n\n` +
+      `${student.name} has canceled their booking with you for ${event.startTime} – ${event.endTime}.\n` +
+      `Booking ID: ${event.bookingId}\n`;
+  }
+};
+
 const processBookingRecord = async (record: SQSRecord, topicArn: string): Promise<void> => {
-  const event = JSON.parse(record.body) as BookingCreatedEvent;
-  if (event.eventType !== 'booking.created') {
-    console.warn(`Skipping unknown event type: ${event.eventType}`);
+  const event = JSON.parse(record.body);
+
+  if (event.eventType !== 'booking.created' && event.eventType !== 'booking.canceled') {
+    console.warn(`Unsupported event type: ${event.eventType}`);
     return;
   }
 
@@ -325,15 +376,20 @@ const processBookingRecord = async (record: SQSRecord, topicArn: string): Promis
     getStudentById(event.studentId),
   ]);
 
-  const subject = 'Booking confirmed';
-  const studentMessage =
-    `Hi ${student.name},\n\n` +
-    `Your booking with ${mentor.name} is confirmed for ${event.startTime} – ${event.endTime}.\n` +
-    `Booking ID: ${event.bookingId}\n`;
-  const mentorMessage =
-    `Hi ${mentor.name},\n\n` +
-    `${student.name} has booked a session with you for ${event.startTime} – ${event.endTime}.\n` +
-    `Booking ID: ${event.bookingId}\n`;
+  let studentMessage: string = '';
+  let mentorMessage: string = '';
+  let subject: string = '';
+  if (event.eventType === 'booking.created') {
+    subject = 'Booking confirmed';
+    studentMessage = constructBookingEmailMessage('student', mentor, student, event);
+    mentorMessage = constructBookingEmailMessage('mentor', mentor, student, event);
+  }
+
+  if (event.eventType === 'booking.canceled') {
+    subject = 'Booking canceled';
+    studentMessage = constructCancellationEmailMessage('student', mentor, student, event);
+    mentorMessage = constructCancellationEmailMessage('mentor', mentor, student, event);
+  }
 
   await Promise.all([
     ensureEmailSubscription(topicArn, student.email),
