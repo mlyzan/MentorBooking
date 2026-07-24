@@ -61,3 +61,22 @@ export interface CreateTimeSlotEvent {
   mentorId: string; 
   body: { startTime: string; endTime: string } 
 }
+
+export enum Sessions {
+  FUTURE = 'FUTURE',
+  PAST = 'PAST',
+}
+export interface BookedSessionsEvent {
+  mentorId: string;
+  sessions: Sessions
+}
+
+export interface BookedSession {
+  id: string;
+  mentorId: string;
+  studentId: string;
+  startTime: string;
+  endTime: string;
+  createdAt: string;
+  timeSlotId: string;
+}

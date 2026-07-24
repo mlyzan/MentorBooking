@@ -23,6 +23,9 @@ import {
   BookingCreatedEvent,
   BookingCanceledEvent,
   CreateTimeSlotEvent,
+  BookedSession,
+  BookedSessionsEvent,
+  Sessions,
  } from '../interfaces';
 
 const client = new DynamoDBClient({});
@@ -459,3 +462,51 @@ export const createTimeSlot: Handler = async (event: CreateTimeSlotEvent): Promi
 
 };
 
+export const getBookedSessions: Handler = async (event: BookedSessionsEvent): Promise<{ sessions: BookedSession[]; }> => {
+  try {
+    const { mentorId, sessions } = event;
+
+    const params: ScanCommandInput = {
+      TableName: BookingsTableName,
+      FilterExpression: '#mentorId = :mentorId',
+      ExpressionAttributeNames: {
+        '#mentorId': 'mentorId',
+      },
+      ExpressionAttributeValues: {
+        ':mentorId': mentorId,
+      },
+    };
+
+    if (sessions && sessions === Sessions.FUTURE) {
+      params.FilterExpression += ' AND #startTime > :startTime'
+      params.ExpressionAttributeNames = {
+        ...params.ExpressionAttributeNames,
+        '#startTime': 'startTime',
+      };
+      params.ExpressionAttributeValues = {
+        ...params.ExpressionAttributeValues,
+        ':startTime': new Date().toISOString(),
+      }
+    }
+
+    if (sessions && sessions === Sessions.PAST) {
+      params.FilterExpression += ' AND #endTime <= :endTime'
+      params.ExpressionAttributeNames = {
+        ...params.ExpressionAttributeNames,
+        '#endTime': 'endTime',
+      };
+      params.ExpressionAttributeValues = {
+        ...params.ExpressionAttributeValues,
+        ':endTime': new Date().toISOString(),
+      }
+    }
+
+    const result = await doc.send(new ScanCommand(params));
+    const resultedSessions = (result.Items as BookedSession[]) || [];
+
+    return { sessions: resultedSessions };
+  } catch(error: any) {
+    console.error('Error creating time slot:', error);
+    throw new Error('InternalServerError: An error occurred while getting booked time slot.');
+  }
+};

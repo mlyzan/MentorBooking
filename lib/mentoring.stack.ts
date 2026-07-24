@@ -87,6 +87,15 @@ export class MentoringLambdaStack extends cdk.Stack {
     });
 
     // Lambda functions
+    const getBookedSessionsLambda = new NodejsFunction(this, 'getBookedSessions', {
+      ...commonProps,
+      handler: 'getBookedSessions',
+      environment: {
+        [BookingsTableNameEnv]: BookingsTableName,
+      },
+    });
+    bookingsTable.grantReadData(getBookedSessionsLambda);
+
     const getMentorsLambda = new NodejsFunction(this, 'getMentors', {
       ...commonProps,
       handler: 'getMentors',
@@ -191,6 +200,33 @@ export class MentoringLambdaStack extends cdk.Stack {
         'application/json': `{
           "expertises": "$util.escapeJavaScript($input.params('expertises'))"
         }`,
+      },
+    });
+
+    const viewBookedSessionsLambdaIntegration = new apigateway.LambdaIntegration(getBookedSessionsLambda, {
+      integrationResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+        },
+        {
+          statusCode: '500',
+          selectionPattern: '^InternalServerError:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("InternalServerError: ", ""))"}`,
+          },
+        }, 
+      ],
+      proxy: false,
+      requestTemplates: {
+        'application/json': `{ 
+          "mentorId": "$util.escapeJavaScript($input.params('mentorId'))", "sessions": "$util.escapeJavaScript($input.params('sessions'))"
+        }`
       },
     });
 
@@ -332,7 +368,29 @@ export class MentoringLambdaStack extends cdk.Stack {
     });
 
     const mentorsResource = api.root.addResource("mentors");
-    const timeSlotsResource = mentorsResource.addResource("{mentorId}").addResource("timeslots");
+    const mentorsExtendedResource = mentorsResource.addResource("{mentorId}");
+    const timeSlotsResource = mentorsExtendedResource.addResource("timeslots");
+    const viewBookedSessionsResource = mentorsExtendedResource.addResource("bookings");
+
+    viewBookedSessionsResource.addMethod('GET', viewBookedSessionsLambdaIntegration, {
+      requestParameters: {
+        'method.request.path.mentorId': true
+      },
+      methodResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+        {
+          statusCode: '500',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+      ],
+    });
 
     mentorsResource.addMethod('GET', mentorsLambdaIntegration, {
       requestParameters: {
