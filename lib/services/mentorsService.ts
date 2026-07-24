@@ -12,62 +12,23 @@ import {
 } from '../constants';
 import { Handler, SQSEvent, SQSRecord } from 'aws-lambda';
 import { v4 as uuidv4 } from 'uuid';
+import { 
+  TimeSlot,
+  BookTimeSlotEvent,
+  CancelBookingEvent,
+  Mentor,
+  Student,
+  GetMentorsEvent,
+  GetTimeSlotsEvent,
+  BookingCreatedEvent,
+  BookingCanceledEvent,
+  CreateTimeSlotEvent,
+ } from '../interfaces';
 
 const client = new DynamoDBClient({});
 const doc = DynamoDBDocumentClient.from(client);
 const sqs = new SQSClient({});
 const sns = new SNSClient({});
-
-export interface Mentor {
-  id: string;
-  name: string;
-  email: string;
-  expertises: string[];
-}
-
-export interface Student {
-  id: string;
-  name: string;
-  email: string;
-}
-
-export interface GetMentorsEvent {
-  expertises?: string;
-}
-
-export interface TimeSlot {
-  id: string;
-  mentorId: string;
-  startTime: string;
-  endTime: string;
-  available: boolean;
-}
-
-export interface GetTimeSlotsEvent {
-  mentorId: string;
-  startTime?: string;
-}
-
-export interface BookingCreatedEvent {
-  eventType: 'booking.created';
-  bookingId: string;
-  timeSlotId: string;
-  mentorId: string;
-  studentId: string;
-  startTime: string;
-  endTime: string;
-  createdAt: string;
-}
-
-export interface BookingCanceledEvent {
-  eventType: 'booking.canceled';
-  bookingId: string;
-  timeSlotId: string;
-  mentorId: string;
-  studentId: string;
-  startTime: string;
-  endTime: string;
-}
 
 const parseCsv = (value?: string): string[] => value ? value.split(',').map(v => v.trim()).filter(Boolean) : [];
 
@@ -132,14 +93,6 @@ export const getTimeSlots: Handler = async (event: GetTimeSlotsEvent): Promise<{
     throw new Error('InternalServerError: An error occurred while fetching time slots.');
   }
 };
-
-export interface BookTimeSlotEvent {
-  body: { timeSlotId: string; mentorId: string; studentId: string; startTime: string; endTime: string };
-}
-
-export interface CancelBookingEvent {
-  bookingId: string;
-}
 
 export const bookTimeSlot: Handler = async (event: BookTimeSlotEvent): Promise<{ message: string; bookingId: string }> => {
   try {
@@ -295,7 +248,7 @@ export const cancelBooking: Handler = async (event: CancelBookingEvent): Promise
 const getMentorById = async (id: string): Promise<Mentor> => {
   const result = await doc.send(new GetCommand({ TableName: MentorsTableName, Key: { id } }));
   if (!result.Item) {
-    throw new Error(`Mentor ${id} not found`);
+    throw new Error(`NotFound: Mentor ${id} not found`);
   }
   return result.Item as Mentor;
 };
@@ -303,7 +256,7 @@ const getMentorById = async (id: string): Promise<Mentor> => {
 const getStudentById = async (id: string): Promise<Student> => {
   const result = await doc.send(new GetCommand({ TableName: StudentsTableName, Key: { id } }));
   if (!result.Item) {
-    throw new Error(`Student ${id} not found`);
+    throw new Error(`NotFound: Student ${id} not found`);
   }
   return result.Item as Student;
 };
@@ -438,3 +391,71 @@ export const sendBookingNotification: Handler = async (event: SQSEvent): Promise
     }
   }
 };
+
+export const createTimeSlot: Handler = async (event: CreateTimeSlotEvent): Promise<{ message: string; timeSlotId: string }> => {
+  try {
+    const mentorId = event.mentorId;
+    const { startTime, endTime } = event.body;
+
+    console.log(`Creating time slot for mentorId: ${mentorId}, startTime: ${startTime}, endTime: ${endTime}`);
+    // Validate mentor existence
+    await getMentorById(mentorId);
+
+    const timeSlotId = uuidv4();
+    const createdAt = new Date().toISOString();
+    if (new Date(startTime) >= new Date(endTime)) {
+      throw new Error('InvalidTimeSlot: Start time must be before end time.');
+    }
+    if (new Date(startTime).getTime() < new Date(createdAt).getTime()) {
+      throw new Error('InvalidTimeSlot: Start time must be in the future.');
+    }
+
+    // Ensures no overlapping time slots exist for the same mentor.
+    const params: ScanCommandInput = {
+      TableName: TimeSlotsTableName,
+      FilterExpression: '#mentorId = :mentorId AND #startTime < :endTime AND #endTime > :startTime',
+      ExpressionAttributeNames: {
+        '#mentorId': 'mentorId',
+        '#startTime': 'startTime',
+        '#endTime': 'endTime',
+      },
+      ExpressionAttributeValues: {
+        ':mentorId': mentorId,
+        ':startTime': startTime,
+        ':endTime': endTime,
+      },
+    };
+
+    const result = await doc.send(new ScanCommand(params));
+    const overlappingSlots = (result.Items as TimeSlot[]) || [];
+
+    if (overlappingSlots.length > 0) {
+      throw new Error('InvalidTimeSlot: Overlapping time slot exists for the same mentor.');
+    }
+
+    // Create a new time slot record in the TimeSlots table
+    await doc.send(new PutCommand({
+      TableName: TimeSlotsTableName,
+      Item: {
+        id: timeSlotId,
+        mentorId,
+        startTime,
+        endTime,
+        available: true,
+        createdAt,
+      },
+    }));
+
+    return { message: 'Time slot created successfully.', timeSlotId };
+
+  } catch (error: any) {
+    console.error('Error creating time slot:', error);
+    if (error.message.startsWith('NotFound:') || error.message.startsWith('InvalidTimeSlot:')) {
+      throw new Error(error.message);
+    } else {
+      throw new Error('InternalServerError: An error occurred while creating the time slot.');
+    }
+  }
+
+};
+

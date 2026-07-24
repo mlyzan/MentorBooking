@@ -118,6 +118,16 @@ export class MentoringLambdaStack extends cdk.Stack {
     timeSlotsTable.grantReadWriteData(bookTimeSlotLambda);
     bookingNotificationsQueue.grantSendMessages(bookTimeSlotLambda);
 
+    const createTimeSlotLambda = new NodejsFunction(this, 'createTimeSlot', {
+      ...commonProps,
+      handler: 'createTimeSlot',
+      environment: {
+        [TimeSlotsTableNameEnv]: TimeSlotsTableName,
+      },
+    });
+    mentorsTable.grantReadData(createTimeSlotLambda);
+    timeSlotsTable.grantReadWriteData(createTimeSlotLambda);
+
     const cancelBookingLambda = new NodejsFunction(this, 'cancelBooking', {
       ...commonProps,
       handler: 'cancelBooking',
@@ -285,6 +295,42 @@ export class MentoringLambdaStack extends cdk.Stack {
       },
     });
 
+    const createTimeSlotLambdaIntegration = new apigateway.LambdaIntegration(createTimeSlotLambda, {
+      integrationResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+        },
+        {
+          statusCode: '404',
+          selectionPattern: '^NotFound:.*|^InvalidTimeSlot:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("NotFound: ", "")).replaceAll("InvalidTimeSlot: ", "")"}`,
+          },
+        },
+        {
+          statusCode: '500',
+          selectionPattern: '^InternalServerError:.*',
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": "'*'",
+          },
+          responseTemplates: {
+            'application/json': `#set($msg = $input.path('$.errorMessage'))\n{"error": true, "message": "$util.escapeJavaScript($msg.replaceAll("InternalServerError: ", ""))"}`,
+          },
+        },
+      ],
+      proxy: false,
+      requestTemplates: {
+        "application/json":
+        `{ "mentorId": "$util.escapeJavaScript($input.params('mentorId'))", "body": $input.json('$') }`
+      },
+    });
+
     const mentorsResource = api.root.addResource("mentors");
     const timeSlotsResource = mentorsResource.addResource("{mentorId}").addResource("timeslots");
 
@@ -316,6 +362,32 @@ export class MentoringLambdaStack extends cdk.Stack {
       methodResponses: [
         {
           statusCode: '200',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+        {
+          statusCode: '500',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+      ],
+    });
+
+    timeSlotsResource.addMethod('POST', createTimeSlotLambdaIntegration,  {
+      requestParameters: {
+        'method.request.path.mentorId': true
+      },
+      methodResponses: [
+        {
+          statusCode: '200',
+          responseParameters: {
+            'method.response.header.Access-Control-Allow-Origin': true,
+          },
+        },
+        {
+          statusCode: '404',
           responseParameters: {
             'method.response.header.Access-Control-Allow-Origin': true,
           },
