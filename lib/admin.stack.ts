@@ -13,6 +13,13 @@ import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import { Construct } from 'constructs';
 import {
   AdminEmailEnv,
+  BookingsExportedQueueUrlEnv,
+  BookingsExportedTopicArnEnv,
+  BookingsExportQueueUrlEnv,
+  BookingsTableName,
+  BookingsTableNameEnv,
+  ExportBookingsPrefix,
+  ExportUrlExpirationSecondsEnv,
   ImportBucketName,
   ImportBucketNameEnv,
   MentorsImportedQueueUrlEnv,
@@ -45,6 +52,7 @@ export class ImportServiceStack extends cdk.Stack {
     });
 
     const mentorsTable = dynamodb.Table.fromTableName(this, 'MentorsTableImported', MentorsTableName);
+    const bookingsTable = dynamodb.Table.fromTableName(this, 'BookingsTableExported', BookingsTableName);
 
     const mentorsImportedDlq = new sqs.Queue(this, 'MentorsImportedDLQ', {
       retentionPeriod: cdk.Duration.days(14),
@@ -66,6 +74,38 @@ export class ImportServiceStack extends cdk.Stack {
       mentorsImportedTopic.addSubscription(new snsSubscriptions.EmailSubscription(adminEmail));
     }
 
+    const bookingsExportDlq = new sqs.Queue(this, 'BookingsExportDLQ', {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
+    const bookingsExportQueue = new sqs.Queue(this, 'BookingsExportQueue', {
+      visibilityTimeout: cdk.Duration.seconds(300),
+      deadLetterQueue: {
+        queue: bookingsExportDlq,
+        maxReceiveCount: 3,
+      },
+    });
+
+    const bookingsExportedDlq = new sqs.Queue(this, 'BookingsExportedDLQ', {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
+    const bookingsExportedQueue = new sqs.Queue(this, 'BookingsExportedQueue', {
+      visibilityTimeout: cdk.Duration.seconds(60),
+      deadLetterQueue: {
+        queue: bookingsExportedDlq,
+        maxReceiveCount: 3,
+      },
+    });
+
+    const bookingsExportedTopic = new sns.Topic(this, 'BookingsExportedTopic', {
+      displayName: 'Bookings Exported Notifications',
+    });
+
+    if (adminEmail) {
+      bookingsExportedTopic.addSubscription(new snsSubscriptions.EmailSubscription(adminEmail));
+    }
+
     const entry = path.join(__dirname, 'services', 'adminService.ts');
     const commonProps = {
       runtime: lambda.Runtime.NODEJS_20_X,
@@ -77,15 +117,59 @@ export class ImportServiceStack extends cdk.Stack {
       },
     };
 
+    const exportBookings = new NodejsFunction(this, 'exportBookings', {
+      ...commonProps,
+      handler: 'exportBookings',
+      environment: {
+        [BookingsExportQueueUrlEnv]: bookingsExportQueue.queueUrl,
+      },
+    });
+    bookingsExportQueue.grantSendMessages(exportBookings);
+
+    const bookingsExportProcessor = new NodejsFunction(this, 'bookingsExportProcessor', {
+      ...commonProps,
+      timeout: cdk.Duration.seconds(300),
+      handler: 'bookingsExportProcessor',
+      environment: {
+        [ImportBucketNameEnv]: bucket.bucketName,
+        [UploadedPrefixEnv]: ExportBookingsPrefix,
+        [BookingsTableNameEnv]: BookingsTableName,
+        [BookingsExportedQueueUrlEnv]: bookingsExportedQueue.queueUrl,
+        [ExportUrlExpirationSecondsEnv]: '604800',
+      },
+    });
+    bucket.grantPut(bookingsExportProcessor);
+    bucket.grantRead(bookingsExportProcessor);
+    bookingsTable.grantReadData(bookingsExportProcessor);
+    bookingsExportedQueue.grantSendMessages(bookingsExportProcessor);
+    bookingsExportProcessor.addEventSource(new SqsEventSource(bookingsExportQueue, {
+      batchSize: 1,
+    }));
+
+    const bookingsExportNotification = new NodejsFunction(this, 'bookingsExportNotification', {
+      ...commonProps,
+      handler: 'bookingsExportNotification',
+      environment: {
+        [BookingsExportedTopicArnEnv]: bookingsExportedTopic.topicArn,
+        [AdminEmailEnv]: adminEmail,
+      },
+    });
+    bookingsExportedTopic.grantPublish(bookingsExportNotification);
+    bookingsExportNotification.addEventSource(new SqsEventSource(bookingsExportedQueue, {
+      batchSize: 10,
+    }));
+
     const importMentorsFile = new NodejsFunction(this, 'importMentorsFile', {
       ...commonProps,
       handler: 'importMentorsFile',
       environment: {
         [ImportBucketNameEnv]: bucket.bucketName,
+        [BookingsTableNameEnv]: BookingsTableName,
         [UploadedPrefixEnv]: UploadedPrefix,
       },
     });
     bucket.grantPut(importMentorsFile);
+    bookingsTable.grantReadData(importMentorsFile);
 
     const importFileParser = new NodejsFunction(this, 'importFileParser', {
       ...commonProps,
@@ -138,6 +222,17 @@ export class ImportServiceStack extends cdk.Stack {
     });
 
     importMentorsResource.addCorsPreflight({
+      allowOrigins: ['*'],
+      allowMethods: ['*'],
+    });
+
+    const exportResource = api.root.addResource('exports');
+    const exportBookingsResource = exportResource.addResource('bookings');
+
+    const exportBookingsLambdaIntegration = new apigateway.LambdaIntegration(exportBookings);
+    exportBookingsResource.addMethod('POST', exportBookingsLambdaIntegration, {});
+
+    exportBookingsResource.addCorsPreflight({
       allowOrigins: ['*'],
       allowMethods: ['*'],
     });

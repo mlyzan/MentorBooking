@@ -1,20 +1,26 @@
 import { Readable } from 'stream';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import { Handler, S3Event, SQSEvent, SQSRecord, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { v4 as uuidv4 } from 'uuid';
 import csvParser from 'csv-parser';
 import {
+  BookingsExportedQueueUrlEnv,
+  BookingsExportedTopicArnEnv,
+  BookingsExportQueueUrlEnv,
+  BookingsTableNameEnv,
+  ExportUrlExpirationSecondsEnv,
   ImportBucketNameEnv,
   MentorsImportedQueueUrlEnv,
   MentorsImportedTopicArnEnv,
   MentorsTableName,
   UploadedPrefixEnv,
 } from '../constants';
-import { Mentor } from '../interfaces';
+import { BookedSession, BookingsExportedEvent, BookingsExportRequestedEvent, Mentor } from '../interfaces';
 
 const s3 = new S3Client({});
 const doc = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -201,6 +207,181 @@ export const mentorsImportNotification: Handler<SQSEvent> = async (event) => {
   for (const record of event.Records) {
     try {
       await processImportedRecord(record, topicArn);
+    } catch (err) {
+      console.error(`Failed to process record ${record.messageId}:`, err);
+      throw err;
+    }
+  }
+};
+
+export const exportBookings: Handler<APIGatewayProxyEvent, APIGatewayProxyResult> = async () => {
+  try {
+    const queueUrl = requireEnv(BookingsExportQueueUrlEnv);
+    const requestedEvent: BookingsExportRequestedEvent = {
+      eventType: 'bookings.export.requested',
+      exportId: uuidv4(),
+      requestedAt: new Date().toISOString(),
+    };
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: queueUrl,
+      MessageBody: JSON.stringify(requestedEvent),
+    }));
+
+    return {
+      statusCode: 202,
+      body: JSON.stringify({
+        message: 'Bookings export scheduled. You will receive an email when it is ready.',
+        exportId: requestedEvent.exportId,
+      }),
+    };
+  } catch (error: any) {
+    console.error('Error scheduling bookings export:', error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: true, message: error.message || 'Failed to schedule bookings export.' }),
+    };
+  }
+};
+
+const BOOKINGS_CSV_HEADER = ['id', 'mentorId', 'studentId', 'timeSlotId', 'startTime', 'endTime', 'createdAt'];
+
+const escapeCsvField = (value: unknown): string => {
+  if (value === undefined || value === null) return '';
+  const str = String(value);
+  return /[",\n\r]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+};
+
+const buildBookingsCsv = (bookings: BookedSession[]): string => {
+  const rows = bookings.map(b => BOOKINGS_CSV_HEADER.map(h => escapeCsvField((b as any)[h])).join(','));
+  return [BOOKINGS_CSV_HEADER.join(','), ...rows].join('\n');
+};
+
+const scanAllBookings = async (tableName: string): Promise<BookedSession[]> => {
+  const items: BookedSession[] = [];
+  let ExclusiveStartKey: Record<string, any> | undefined;
+  do {
+    const result = await doc.send(new ScanCommand({
+      TableName: tableName,
+      ExclusiveStartKey,
+    }));
+    if (result.Items) items.push(...(result.Items as BookedSession[]));
+    ExclusiveStartKey = result.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return items;
+};
+
+const processExportRequest = async (record: SQSRecord): Promise<void> => {
+  const bucket = requireEnv(ImportBucketNameEnv);
+  const prefix = requireEnv(UploadedPrefixEnv);
+  const tableName = requireEnv(BookingsTableNameEnv);
+  const notifyQueueUrl = requireEnv(BookingsExportedQueueUrlEnv);
+  const expiresIn = Number(process.env[ExportUrlExpirationSecondsEnv] || 604800);
+
+  const request = JSON.parse(record.body) as BookingsExportRequestedEvent;
+  if (request.eventType !== 'bookings.export.requested') {
+    console.warn(`Unsupported event type: ${request.eventType}`);
+    return;
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const key = `${prefix}${timestamp}/bookings.csv`;
+  let status: 'success' | 'failure' = 'success';
+  let recordCount = 0;
+  let downloadUrl = '';
+  let errorMessage: string | undefined;
+
+  try {
+    const bookings = await scanAllBookings(tableName);
+    recordCount = bookings.length;
+    const csv = buildBookingsCsv(bookings);
+
+    await s3.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: csv,
+      ContentType: 'text/csv',
+      ServerSideEncryption: 'AES256',
+    }));
+
+    downloadUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: bucket, Key: key }),
+      { expiresIn },
+    );
+  } catch (err: any) {
+    console.error('Failed to export bookings:', err);
+    status = 'failure';
+    errorMessage = err.message || 'Unknown error';
+  }
+
+  const exportedEvent: BookingsExportedEvent = {
+    eventType: 'bookings.exported',
+    exportId: request.exportId,
+    status,
+    recordCount,
+    bucket,
+    key,
+    downloadUrl,
+    exportedAt: new Date().toISOString(),
+    error: errorMessage,
+  };
+  await sqs.send(new SendMessageCommand({
+    QueueUrl: notifyQueueUrl,
+    MessageBody: JSON.stringify(exportedEvent),
+  }));
+};
+
+export const bookingsExportProcessor: Handler<SQSEvent> = async (event) => {
+  for (const record of event.Records) {
+    try {
+      await processExportRequest(record);
+    } catch (err) {
+      console.error(`Failed to process export request ${record.messageId}:`, err);
+      throw err;
+    }
+  }
+};
+
+const buildExportEmail = (event: BookingsExportedEvent): { subject: string; message: string } => {
+  if (event.status === 'failure') {
+    return {
+      subject: `Bookings export failed (${event.exportId})`,
+      message:
+        `Bookings export failed at ${event.exportedAt}.\n\n` +
+        `Export ID: ${event.exportId}\n` +
+        `Error: ${event.error || 'Unknown error'}`,
+    };
+  }
+  return {
+    subject: `Bookings export ready: ${event.recordCount} records`,
+    message:
+      `Bookings export completed at ${event.exportedAt}.\n\n` +
+      `Export ID: ${event.exportId}\n` +
+      `Records: ${event.recordCount}\n` +
+      `Location: s3://${event.bucket}/${event.key}\n\n` +
+      `Download link (temporary):\n${event.downloadUrl}`,
+  };
+};
+
+const processExportedRecord = async (record: SQSRecord, topicArn: string): Promise<void> => {
+  const event = JSON.parse(record.body) as BookingsExportedEvent;
+  if (event.eventType !== 'bookings.exported') {
+    console.warn(`Unsupported event type: ${event.eventType}`);
+    return;
+  }
+  const { subject, message } = buildExportEmail(event);
+  await sns.send(new PublishCommand({
+    TopicArn: topicArn,
+    Subject: subject.slice(0, 100),
+    Message: message,
+  }));
+};
+
+export const bookingsExportNotification: Handler<SQSEvent> = async (event) => {
+  const topicArn = requireEnv(BookingsExportedTopicArnEnv);
+  for (const record of event.Records) {
+    try {
+      await processExportedRecord(record, topicArn);
     } catch (err) {
       console.error(`Failed to process record ${record.messageId}:`, err);
       throw err;

@@ -80,3 +80,21 @@ export interface BookedSession {
   createdAt: string;
   timeSlotId: string;
 }
+
+export interface BookingsExportRequestedEvent {
+  eventType: 'bookings.export.requested';
+  exportId: string;
+  requestedAt: string;
+}
+
+export interface BookingsExportedEvent {
+  eventType: 'bookings.exported';
+  exportId: string;
+  status: 'success' | 'failure';
+  recordCount: number;
+  bucket: string;
+  key: string;
+  downloadUrl: string;
+  exportedAt: string;
+  error?: string;
+}
