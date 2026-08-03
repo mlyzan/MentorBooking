@@ -23,9 +23,13 @@ import {
 } from './constants';
 
 
+export interface MentoringLambdaStackProps extends cdk.StackProps {
+  authorizerFnArn: string;
+}
+
 export class MentoringLambdaStack extends cdk.Stack {
 
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: MentoringLambdaStackProps) {
     super(scope, id, props);
 
     const entry = path.join(__dirname, 'services', 'mentorsService.ts');
@@ -175,7 +179,22 @@ export class MentoringLambdaStack extends cdk.Stack {
       restApiName: "Mentors API Gateway",
       description: "This API serves the Lambda functions."
     });
-    
+
+    const authorizerFn = lambda.Function.fromFunctionAttributes(this, 'ImportedAuthorizerFn', {
+      functionArn: props.authorizerFnArn,
+      sameEnvironment: true,
+      skipPermissions: true,
+    });
+    const authorizer = new apigateway.RequestAuthorizer(this, 'RbacAuthorizer', {
+      handler: authorizerFn,
+      identitySources: [apigateway.IdentitySource.header('Authorization')],
+      resultsCacheTtl: cdk.Duration.seconds(0),
+    });
+    const authOpts = {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.CUSTOM,
+    };
+
     const mentorsLambdaIntegration = new apigateway.LambdaIntegration(getMentorsLambda, {
       integrationResponses: [
         {
@@ -373,6 +392,7 @@ export class MentoringLambdaStack extends cdk.Stack {
     const viewBookedSessionsResource = mentorsExtendedResource.addResource("bookings");
 
     viewBookedSessionsResource.addMethod('GET', viewBookedSessionsLambdaIntegration, {
+      ...authOpts,
       requestParameters: {
         'method.request.path.mentorId': true
       },
@@ -393,6 +413,7 @@ export class MentoringLambdaStack extends cdk.Stack {
     });
 
     mentorsResource.addMethod('GET', mentorsLambdaIntegration, {
+      ...authOpts,
       requestParameters: {
         'method.request.querystring.expertises': false
       },
@@ -413,6 +434,7 @@ export class MentoringLambdaStack extends cdk.Stack {
     });
 
     timeSlotsResource.addMethod('GET', timeSlotsLambdaIntegration, {
+      ...authOpts,
       requestParameters: {
         'method.request.path.mentorId': true,
         'method.request.querystring.startTime': false
@@ -434,6 +456,7 @@ export class MentoringLambdaStack extends cdk.Stack {
     });
 
     timeSlotsResource.addMethod('POST', createTimeSlotLambdaIntegration,  {
+      ...authOpts,
       requestParameters: {
         'method.request.path.mentorId': true
       },
@@ -461,6 +484,7 @@ export class MentoringLambdaStack extends cdk.Stack {
 
     const bookingsResource = api.root.addResource("bookings");
     bookingsResource.addMethod('POST', bookTimeSlotLambdaIntegration, {
+      ...authOpts,
       methodResponses: [
         {
           statusCode: '200',
@@ -485,6 +509,7 @@ export class MentoringLambdaStack extends cdk.Stack {
 
     const deleteBookingResource = bookingsResource.addResource("{bookingId}")
     deleteBookingResource.addMethod('DELETE', cancelBookingLambdaIntegration, {
+      ...authOpts,
       requestParameters: {
         'method.request.path.bookingId': true
       },

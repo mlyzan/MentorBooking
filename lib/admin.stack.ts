@@ -31,8 +31,12 @@ import {
 } from './constants';
 
 
+export interface ImportServiceStackProps extends cdk.StackProps {
+  authorizerFnArn: string;
+}
+
 export class ImportServiceStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: ImportServiceStackProps) {
     super(scope, id, props);
 
     const adminEmail = process.env.ADMIN_EMAIL || '';
@@ -210,12 +214,28 @@ export class ImportServiceStack extends cdk.Stack {
       binaryMediaTypes: ['text/csv', 'multipart/form-data', 'application/octet-stream'],
     });
 
+    const authorizerFn = lambda.Function.fromFunctionAttributes(this, 'ImportedAuthorizerFn', {
+      functionArn: props.authorizerFnArn,
+      sameEnvironment: true,
+      skipPermissions: true,
+    });
+    const authorizer = new apigateway.RequestAuthorizer(this, 'RbacAuthorizer', {
+      handler: authorizerFn,
+      identitySources: [apigateway.IdentitySource.header('Authorization')],
+      resultsCacheTtl: cdk.Duration.seconds(0),
+    });
+    const authOpts = {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.CUSTOM,
+    };
+
     const importMentorsLambdaIntegration = new apigateway.LambdaIntegration(importMentorsFile);
 
     const importResource = api.root.addResource('import');
     const importMentorsResource = importResource.addResource('mentors');
 
     importMentorsResource.addMethod('POST', importMentorsLambdaIntegration, {
+      ...authOpts,
       requestParameters: {
         'method.request.querystring.name': false,
       },
@@ -230,7 +250,9 @@ export class ImportServiceStack extends cdk.Stack {
     const exportBookingsResource = exportResource.addResource('bookings');
 
     const exportBookingsLambdaIntegration = new apigateway.LambdaIntegration(exportBookings);
-    exportBookingsResource.addMethod('POST', exportBookingsLambdaIntegration, {});
+    exportBookingsResource.addMethod('POST', exportBookingsLambdaIntegration, {
+      ...authOpts,
+    });
 
     exportBookingsResource.addCorsPreflight({
       allowOrigins: ['*'],
